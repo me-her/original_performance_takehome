@@ -115,12 +115,21 @@ class KernelBuilder:
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             c1 = self.scratch_const(val1, f"h_{hi}_v1")
             c3 = self.scratch_const(val3, f"h_{hi}_v3")
+            mc_val = None
+            if hi in [0, 2, 4]:
+                mc_val = (1 << val3) + 1
+            mc = self.scratch_const(mc_val, f"h_{hi}_mc") if mc_val else None
+
             self.flush_bundle()
             bc1 = self.alloc_scratch(f"h_{hi}_c1", VLEN)
             bc3 = self.alloc_scratch(f"h_{hi}_c3", VLEN)
+            bmc = self.alloc_scratch(f"h_{hi}_mc_vec", VLEN) if mc_val else None
+
             self.add("valu", ("vbroadcast", bc1, c1))
             self.add("valu", ("vbroadcast", bc3, c3))
-            hash_const_vecs.append((bc1, bc3))
+            if bmc:
+                self.add("valu", ("vbroadcast", bmc, mc))
+            hash_const_vecs.append((bc1, bc3, bmc))
         
         # Scratch
         idx = [self.alloc_scratch(f"idx{b}", VLEN) for b in range(NB)]
@@ -149,6 +158,9 @@ class KernelBuilder:
             self.add("alu", ("+", ptr_val[b], meta["inp_values_p"], block_offsets[b]))
         self.flush_bundle()
 
+        # Main Loop
+        delay_per_block = 0
+        
         # --- Stream Logic ---
         class StreamBuilder:
             def __init__(self):
@@ -169,8 +181,13 @@ class KernelBuilder:
                 self.flush()
                 return deque(self.bundles)
 
-        def make_stream(b):
+        def make_stream(b, delay=0):
             sb = StreamBuilder()
+            
+            # Delay start to stagger blocks and maximize overlap
+            for _ in range(delay):
+                sb.add("alu", ("+", ptr_idx[b], ptr_idx[b], zero_const))
+                sb.flush()
             
             # 1. LOAD PHASE
             sb.add("load", ("vload", idx[b], ptr_idx[b]))
@@ -196,26 +213,38 @@ class KernelBuilder:
                 sb.flush()
                 
                 # Hash Stages
+                # Hash Stages
                 for hi in range(6):
                     op1, val1, op2, op3, val3 = HASH_STAGES[hi]
-                    bc1, bc3 = hash_const_vecs[hi]
-                    sb.add("valu", (op1, tmp1[b], val[b], bc1))
-                    sb.add("valu", (op3, tmp2[b], val[b], bc3))
-                    sb.flush()
-                    sb.add("valu", (op2, val[b], tmp1[b], tmp2[b]))
-                    sb.flush()
+                    bc1, bc3, bmc = hash_const_vecs[hi]
+                    
+                    if bmc:
+                        sb.add("valu", ("multiply_add", val[b], val[b], bmc, bc1))
+                        sb.flush()
+                    else:
+                        sb.add("valu", (op1, tmp1[b], val[b], bc1))
+                        sb.add("valu", (op3, tmp2[b], val[b], bc3))
+                        sb.flush()
+                        sb.add("valu", (op2, val[b], tmp1[b], tmp2[b]))
+                        sb.flush()
                 
                 # Index Update
+                # Optimize dependency: 
+                # tmp1 = val & 1
+                # idx = idx * 2 + 1 (parallel with tmp1)
+                # idx = idx + tmp1
+                
                 sb.add("valu", ("&", tmp1[b], val[b], one_vec))
+                sb.add("valu", ("multiply_add", idx[b], idx[b], two_vec, one_vec))
                 sb.flush()
-                sb.add("valu", ("+", tmp1[b], tmp1[b], one_vec))
-                sb.flush()
-                sb.add("valu", ("multiply_add", idx[b], idx[b], two_vec, tmp1[b]))
+                
+                sb.add("valu", ("+", idx[b], idx[b], tmp1[b]))
                 sb.flush()
                 
                 # Wrap Check
                 sb.add("valu", ("<", tmp1[b], idx[b], n_nodes_vec))
                 sb.flush()
+                # Use flow vselect to offload VALU unit
                 sb.add("flow", ("vselect", idx[b], tmp1[b], idx[b], zero_vec))
                 sb.flush()
                 
@@ -283,7 +312,7 @@ class KernelBuilder:
         for it in range(num_iters):
             streams = []
             for b in range(NB):
-                streams.append(make_stream(b))
+                streams.append(make_stream(b, b * delay_per_block))
             
             merge_streams(streams)
 
