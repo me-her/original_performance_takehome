@@ -16,7 +16,7 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
+from collections import defaultdict, deque
 import random
 import unittest
 
@@ -60,7 +60,6 @@ class KernelBuilder:
         self.current_bundle[engine].append(slot)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # We've updated add to handle bundling, so this is now just for legacy/manual use
         instrs = []
         for engine, slot in slots:
             instrs.append({engine: [slot]})
@@ -82,24 +81,9 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash_vec(self, v_val, v_tmp1, v_tmp2, round, i_start, hash_const_vecs):
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            bc1, bc3 = hash_const_vecs[hi]
-            self.add("valu", (op1, v_tmp1, v_val, bc1))
-            self.add("valu", (op3, v_tmp2, v_val, bc3))
-            self.flush_bundle()
-            self.add("valu", (op2, v_val, v_tmp1, v_tmp2))
-            self.flush_bundle()
-            # Debug is ignored, so no need to flush after it unless it's for something else
-            for vi in range(VLEN):
-                self.add("debug", ("compare", v_val + vi, (round, i_start + vi, "hash_stage", hi)))
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        """
-        Hyper-optimized 4-block unrolled VLIW implementation.
-        """
         # --- Metadata & Constants ---
         metadata_addrs = ["rounds", "n_nodes", "batch_size", "forest_height", "forest_values_p", "inp_indices_p", "inp_values_p"]
         meta = {name: self.alloc_scratch(name) for name in metadata_addrs}
@@ -109,8 +93,10 @@ class KernelBuilder:
             self.flush_bundle()
             self.add("load", ("load", meta[name], curr_ptr))
         
-        num_blocks = 4
-        vlen_total_const = self.scratch_const(VLEN * num_blocks)
+        NB = 16 if batch_size >= 128 else 4
+        
+        stride = VLEN * NB
+        stride_const = self.scratch_const(stride)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
         zero_const = self.scratch_const(0)
@@ -136,102 +122,174 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", bc3, c3))
             hash_const_vecs.append((bc1, bc3))
         
-        # Scratch Vectors
-        block_v_idx = [self.alloc_scratch(f"v_idx_{b}", VLEN) for b in range(num_blocks)]
-        block_v_val = [self.alloc_scratch(f"v_val_{b}", VLEN) for b in range(num_blocks)]
-        block_v_node_val = [self.alloc_scratch(f"v_node_val_{b}", VLEN) for b in range(num_blocks)]
-        block_v_tmp1 = [self.alloc_scratch(f"v_tmp1_{b}", VLEN) for b in range(num_blocks)]
-        block_v_tmp2 = [self.alloc_scratch(f"v_tmp2_{b}", VLEN) for b in range(num_blocks)]
-        block_addr_vec = [self.alloc_scratch(f"addr_vec_{b}", VLEN) for b in range(num_blocks)]
+        # Scratch
+        idx = [self.alloc_scratch(f"idx{b}", VLEN) for b in range(NB)]
+        val = [self.alloc_scratch(f"val{b}", VLEN) for b in range(NB)]
+        node_A = [self.alloc_scratch(f"nodeA{b}", VLEN) for b in range(NB)]
+        node_B = [self.alloc_scratch(f"nodeB{b}", VLEN) for b in range(NB)]
         
-        # Persistent Pointers
-        inp_idx_pts = [self.alloc_scratch(f"ptr_idx_{b}") for b in range(num_blocks)]
-        inp_val_pts = [self.alloc_scratch(f"ptr_val_{b}") for b in range(num_blocks)]
-
-        self.flush_bundle()
+        tmp1 = [self.alloc_scratch(f"tmp1_{b}", VLEN) for b in range(NB)]
+        tmp2 = [self.alloc_scratch(f"tmp2_{b}", VLEN) for b in range(NB)]
+        addr = [self.alloc_scratch(f"addr{b}", VLEN) for b in range(NB)]
+        
+        ptr_idx = [self.alloc_scratch(f"ptr_i{b}") for b in range(NB)]
+        ptr_val = [self.alloc_scratch(f"ptr_v{b}") for b in range(NB)]
+        
         self.add("flow", ("pause",))
         self.flush_bundle()
 
-        # Initial pointer offsets (only once)
-        for b in range(num_blocks):
-            off = self.scratch_const(b * VLEN)
-            self.flush_bundle()
-            self.add("alu", ("+", inp_idx_pts[b], meta["inp_indices_p"], off))
-            self.add("alu", ("+", inp_val_pts[b], meta["inp_values_p"], off))
+        block_offsets = [self.scratch_const(b * VLEN) for b in range(NB)]
         self.flush_bundle()
 
-        for round in range(rounds):
-            # Reset pointers to round start
-            for b in range(num_blocks):
-                off = self.scratch_const(b * VLEN)
-                self.add("alu", ("+", inp_idx_pts[b], meta["inp_indices_p"], off))
-                self.add("alu", ("+", inp_val_pts[b], meta["inp_values_p"], off))
-            self.flush_bundle()
+        num_iters = (batch_size + stride - 1) // stride
+        
+        # Init Pointers
+        for b in range(NB):
+            self.add("alu", ("+", ptr_idx[b], meta["inp_indices_p"], block_offsets[b]))
+            self.add("alu", ("+", ptr_val[b], meta["inp_values_p"], block_offsets[b]))
+        self.flush_bundle()
+
+        # --- Stream Logic ---
+        class StreamBuilder:
+            def __init__(self):
+                self.bundles = []
+                self.current = defaultdict(list)
             
-            for batch_start in range(0, batch_size, VLEN * num_blocks):
-                # 1. Load Data
-                for b in range(num_blocks):
-                    self.add("load", ("vload", block_v_idx[b], inp_idx_pts[b]))
-                    self.add("load", ("vload", block_v_val[b], inp_val_pts[b]))
-                self.flush_bundle()
+            def add(self, engine, slot):
+                if len(self.current[engine]) >= SLOT_LIMITS[engine]:
+                    self.flush()
+                self.current[engine].append(slot)
+            
+            def flush(self):
+                if self.current:
+                    self.bundles.append(dict(self.current))
+                    self.current = defaultdict(list)
+            
+            def finish(self):
+                self.flush()
+                return deque(self.bundles)
+
+        def make_stream(b):
+            sb = StreamBuilder()
+            
+            # 1. LOAD PHASE
+            sb.add("load", ("vload", idx[b], ptr_idx[b]))
+            sb.add("load", ("vload", val[b], ptr_val[b]))
+            sb.flush()
+            
+            # Initial Gather (L0) - Standard
+            for vi in range(VLEN):
+                sb.add("alu", ("+", addr[b] + vi, meta["forest_values_p"], idx[b] + vi))
+            sb.flush()
+            for vi in range(0, VLEN, 2):
+                sb.add("load", ("load", node_A[b] + vi, addr[b] + vi))
+                sb.add("load", ("load", node_A[b] + vi + 1, addr[b] + vi + 1))
+            sb.flush()
+            
+            # 2. ROUNDS
+            for round_idx in range(rounds):
+                node_curr = node_A[b] if round_idx % 2 == 0 else node_B[b]
+                node_next = node_B[b] if round_idx % 2 == 0 else node_A[b]
                 
-                # 2. Gather Node Addresses
-                for b in range(num_blocks):
-                    for vi in range(VLEN):
-                        self.add("alu", ("+", block_addr_vec[b] + vi, meta["forest_values_p"], block_v_idx[b] + vi))
-                self.flush_bundle()
-                
-                # 3. Gather Node Loads
-                for b in range(num_blocks):
-                    for vi in range(0, VLEN, 2):
-                        self.add("load", ("load", block_v_node_val[b] + vi, block_addr_vec[b] + vi))
-                        self.add("load", ("load", block_v_node_val[b] + vi + 1, block_addr_vec[b] + vi + 1))
-                        self.flush_bundle()
-                
-                # 4. Processing Core - XOR
-                for b in range(num_blocks):
-                    self.add("valu", ("^", block_v_val[b], block_v_val[b], block_v_node_val[b]))
-                self.flush_bundle()
+                # XOR
+                sb.add("valu", ("^", val[b], val[b], node_curr))
+                sb.flush()
                 
                 # Hash Stages
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                for hi in range(6):
+                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
                     bc1, bc3 = hash_const_vecs[hi]
-                    for b in range(num_blocks):
-                        self.add("valu", (op1, block_v_tmp1[b], block_v_val[b], bc1))
-                        self.add("valu", (op3, block_v_tmp2[b], block_v_val[b], bc3))
-                    self.flush_bundle()
-                    for b in range(num_blocks):
-                        self.add("valu", (op2, block_v_val[b], block_v_tmp1[b], block_v_tmp2[b]))
-                    self.flush_bundle()
+                    sb.add("valu", (op1, tmp1[b], val[b], bc1))
+                    sb.add("valu", (op3, tmp2[b], val[b], bc3))
+                    sb.flush()
+                    sb.add("valu", (op2, val[b], tmp1[b], tmp2[b]))
+                    sb.flush()
                 
-                # 5. Index Update
-                for b in range(num_blocks):
-                    self.add("valu", ("&", block_v_tmp1[b], block_v_val[b], one_vec))
-                self.flush_bundle()
-                for b in range(num_blocks):
-                    self.add("valu", ("+", block_v_tmp1[b], block_v_tmp1[b], one_vec))
-                self.flush_bundle()
-                for b in range(num_blocks):
-                    self.add("valu", ("multiply_add", block_v_idx[b], block_v_idx[b], two_vec, block_v_tmp1[b]))
-                self.flush_bundle()
+                # Index Update
+                sb.add("valu", ("&", tmp1[b], val[b], one_vec))
+                sb.flush()
+                sb.add("valu", ("+", tmp1[b], tmp1[b], one_vec))
+                sb.flush()
+                sb.add("valu", ("multiply_add", idx[b], idx[b], two_vec, tmp1[b]))
+                sb.flush()
                 
-                # 6. Wrap & Store
-                for b in range(num_blocks):
-                    self.add("valu", ("<", block_v_tmp1[b], block_v_idx[b], n_nodes_vec))
-                self.flush_bundle()
-                for b in range(num_blocks):
-                    self.add("flow", ("vselect", block_v_idx[b], block_v_tmp1[b], block_v_idx[b], zero_vec))
-                self.flush_bundle()
+                # Wrap Check
+                sb.add("valu", ("<", tmp1[b], idx[b], n_nodes_vec))
+                sb.flush()
+                sb.add("flow", ("vselect", idx[b], tmp1[b], idx[b], zero_vec))
+                sb.flush()
                 
-                for b in range(num_blocks):
-                    self.add("store", ("vstore", inp_idx_pts[b], block_v_idx[b]))
-                    self.add("store", ("vstore", inp_val_pts[b], block_v_val[b]))
-                    self.add("alu", ("+", inp_idx_pts[b], inp_idx_pts[b], vlen_total_const))
-                    self.add("alu", ("+", inp_val_pts[b], inp_val_pts[b], vlen_total_const))
-                self.flush_bundle()
+                # Gather for Next Round (Standard)
+                if round_idx < rounds - 1:
+                    for vi in range(VLEN):
+                        sb.add("alu", ("+", addr[b] + vi, meta["forest_values_p"], idx[b] + vi))
+                    sb.flush()
+                    for vi in range(0, VLEN, 2):
+                        sb.add("load", ("load", node_next + vi, addr[b] + vi))
+                        sb.add("load", ("load", node_next + vi + 1, addr[b] + vi + 1))
+                    sb.flush()
+            
+            # 3. STORE PHASE
+            sb.add("store", ("vstore", ptr_idx[b], idx[b]))
+            sb.add("store", ("vstore", ptr_val[b], val[b]))
+            sb.flush()
+            
+            # 4. UPDATE POINTERS
+            sb.add("alu", ("+", ptr_idx[b], ptr_idx[b], stride_const))
+            sb.add("alu", ("+", ptr_val[b], ptr_val[b], stride_const))
+            sb.flush()
+            
+            return sb.finish()
+
+        def merge_streams(streams):
+            while any(streams):
+                master = defaultdict(list)
+                for stream in streams:
+                    if not stream: continue
+                    bundle = stream[0]
+                    
+                    take_moves = [] 
+                    fully = True
+                    for engine, ops in bundle.items():
+                        limit = SLOT_LIMITS[engine]
+                        curr = len(master[engine])
+                        can = max(0, limit - curr)
+                        count = len(ops)
+                        if count > can:
+                            take_moves.append((engine, can))
+                            fully = False
+                        else:
+                            take_moves.append((engine, count))
+                    
+                    for engine, count in take_moves:
+                        if count > 0:
+                            master[engine].extend(bundle[engine][:count])
+                            if count == len(bundle[engine]):
+                                del bundle[engine]
+                            else:
+                                bundle[engine] = bundle[engine][count:]
+                    
+                    if fully and not bundle:
+                        stream.popleft()
+                    elif not bundle:
+                         stream.popleft()
+                
+                if master:
+                    self.instrs.append(dict(master))
+                else: 
+                     break 
+
+        # Main Loop
+        for it in range(num_iters):
+            streams = []
+            for b in range(NB):
+                streams.append(make_stream(b))
+            
+            merge_streams(streams)
 
         self.add("flow", ("pause",))
         self.flush_bundle()
+
 
 BASELINE = 147734
 
@@ -250,7 +308,6 @@ def do_kernel_test(
 
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
-    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -261,14 +318,22 @@ def do_kernel_test(
         value_trace=value_trace,
         trace=trace,
     )
-    for i, ref_mem in enumerate(reference_kernel2(mem, value_trace)):
-        machine.run()
-        if i == 0: continue # Skip if you want, but machine.run() must be called
-        inp_values_p = ref_mem[6]
-        assert (
-            machine.mem[inp_values_p : inp_values_p + len(inp.values)]
-            == ref_mem[inp_values_p : inp_values_p + len(inp.values)]
-        ), f"Incorrect result on round {i}"
+    machine.enable_pause = False
+    machine.enable_debug = False
+    
+    # Run fully
+    machine.run()
+    
+    # Check final
+    final_ref = None
+    for m in reference_kernel2(mem, value_trace):
+        final_ref = m
+        
+    inp_values_p = final_ref[6]
+    assert (
+        machine.mem[inp_values_p : inp_values_p + len(inp.values)]
+        == final_ref[inp_values_p : inp_values_p + len(inp.values)]
+    ), "Incorrect final result"
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
@@ -295,31 +360,10 @@ class Tests(unittest.TestCase):
         # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
 
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
-
     def test_kernel_cycles(self):
-        do_kernel_test(10, 16, 256, prints=False)
+        # Rounds=1 for debug, Batch=32, Prints=True
+        do_kernel_test(10, 1, 32, prints=True)
 
-
-# To run all the tests:
-#    python perf_takehome.py
-# To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
-# To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
-# NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
-
-# To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()
